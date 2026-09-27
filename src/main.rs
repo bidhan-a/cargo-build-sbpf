@@ -1,10 +1,13 @@
 use std::{
     env,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
+    path::PathBuf,
     process::{Command, ExitCode},
 };
 
+use anyhow::Result;
 use clap::Parser;
+use toml_edit::Value;
 
 mod config;
 mod setup;
@@ -24,6 +27,14 @@ struct CommandLine {
     #[clap(long, value_enum)]
     arch: Option<SbpfArch>,
 
+    /// Dump the linked LLVM module and control-flow graphs into this directory.
+    #[clap(long, value_name = "DIR")]
+    dump: Option<PathBuf>,
+
+    /// Show the Cargo command and enable Cargo's verbose output.
+    #[clap(short, long)]
+    verbose: bool,
+
     #[clap(
         long = "simd-0460",
         hide = true,
@@ -33,8 +44,8 @@ struct CommandLine {
     simd_0460: bool,
 }
 
-fn main() -> anyhow::Result<ExitCode> {
-    let CargoCli::BuildSbpf(CommandLine { arch, simd_0460 }) =
+fn main() -> Result<ExitCode> {
+    let CargoCli::BuildSbpf(CommandLine { arch, dump, verbose, simd_0460 }) =
         CargoCli::parse();
 
     let (build_config, cargo_config) = BuildConfig::load(arch, simd_0460)?;
@@ -48,17 +59,20 @@ fn main() -> anyhow::Result<ExitCode> {
     };
 
     macro_rules! rustflags {
-        ($($flag:expr),+ $(,)?) => {{
+        ($($codegen_flag:expr),+; $($rustc_flag:expr),+ $(,)?) => {{
             let mut flags = Vec::new();
             $(
                 flags.push("-C".to_string());
-                flags.push(($flag).to_string());
+                flags.push(($codegen_flag).to_string());
+            )+
+            $(
+                flags.push(($rustc_flag).to_string());
             )+
             flags.join(" ")
         }};
     }
 
-    let rustflags = rustflags!(
+    let mut rustflags = rustflags!(
         "linker=sbpf-linker",
         "panic=abort",
         "relocation-model=static",
@@ -70,7 +84,10 @@ fn main() -> anyhow::Result<ExitCode> {
         "link-arg=--llvm-args=--disable-ldsx",
         "link-arg=--llvm-args=--disable-movsx",
         format!("target-cpu={cpu}"),
-        "target-feature=+allows-misaligned-mem-access",
+        "target-feature=+allows-misaligned-mem-access";
+        "--cfg=target_os=\"solana\"",
+        "--cfg=target_feature=\"static-syscalls\"",
+        "-A explicit_builtin_cfgs_in_flags",
     );
 
     let mut command = Command::new(cargo);
@@ -87,16 +104,74 @@ fn main() -> anyhow::Result<ExitCode> {
         .arg("bpfel-unknown-none")
         .arg("-Z")
         .arg("build-std=core,alloc");
+    if verbose {
+        command.arg("--verbose");
+    }
 
     if let Some(config) = cargo_config {
         eprintln!("using Cargo config at {}", config.path.display());
         command
             .arg("--config")
-            .arg(r#"target.bpfel-unknown-none.linker="sbpf-linker""#);
+            .arg(r#"target.bpfel-unknown-none.linker="sbpf-linker""#)
+            .arg("--config")
+            .arg(
+                r#"target.bpfel-unknown-none.rustflags=['--cfg=target_os="solana"', '--cfg=target_feature="static-syscalls"', "-A", "explicit_builtin_cfgs_in_flags"]"#,
+            );
+        if !config.has_arch {
+            command.arg("--config").arg(format!(
+                "target.bpfel-unknown-none.rustflags=[\"-C\", {}]",
+                Value::from(format!("link-arg=--arch={arch}")),
+            ));
+        }
+        if let Some(path) = dump {
+            command.arg("--config").arg(format!(
+                "target.bpfel-unknown-none.rustflags=[\"-C\", {}, \"-C\", {}]",
+                Value::from(format!(
+                    "link-arg=--dump-module={}",
+                    path.display()
+                )),
+                Value::from(format!(
+                    "link-arg=--dump-cfg-dir={}",
+                    path.display()
+                )),
+            ));
+        }
     } else {
+        if let Some(path) = dump {
+            rustflags.extend([
+                format!(" -C link-arg=--dump-module={}", path.display()),
+                format!(" -C link-arg=--dump-cfg-dir={}", path.display()),
+            ]);
+        }
         command.env("CARGO_TARGET_BPFEL_UNKNOWN_NONE_RUSTFLAGS", rustflags);
     }
 
+    if verbose {
+        let display_arg = |arg: &OsStr| {
+            let arg = arg.to_string_lossy();
+            if !arg.is_empty()
+                && arg.chars().all(|character| {
+                    character.is_ascii_alphanumeric()
+                        || matches!(
+                            character,
+                            '-' | '_' | '.' | '/' | '=' | '+' | ':' | ','
+                        )
+                })
+            {
+                arg.into_owned()
+            } else {
+                format!("{arg:?}")
+            }
+        };
+        eprintln!(
+            "running: {}",
+            std::iter::once(command.get_program())
+                .chain(command.get_args())
+                .map(display_arg)
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
     let status = command.status()?;
     Ok(ExitCode::from(status.code().unwrap_or(1).try_into().unwrap_or(1)))
 }

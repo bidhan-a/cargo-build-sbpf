@@ -29,6 +29,7 @@ pub(crate) struct BuildConfig {
 
 pub(crate) struct CargoConfig {
     pub(crate) path: PathBuf,
+    pub(crate) has_arch: bool,
 }
 
 fn check_conflict<T: Copy + Eq>(
@@ -135,12 +136,18 @@ impl BuildConfig {
 
         let expected = build_config.stack_size();
         if configured_stack_size != Some(expected) {
-            let prompt = configured_stack_size.map_or_else(
-                || format!("Cargo config has no BPF stack size. Update {} to use {expected}?", path.display()),
-                |configured| format!("Cargo config uses BPF stack size {configured}, but this build requires {expected}. Update {}?", path.display()),
-            );
+            match configured_stack_size {
+                None => eprintln!(
+                    "Cargo config at {} has no BPF stack size; this build requires {expected}.",
+                    path.display()
+                ),
+                Some(configured) => eprintln!(
+                    "Cargo config at {} uses BPF stack size {configured}; this build requires {expected}.",
+                    path.display()
+                ),
+            }
             if !Confirm::new()
-                .with_prompt(prompt)
+                .with_prompt("Update the Cargo config?")
                 .default(false)
                 .interact()
                 .context("failed to request permission")?
@@ -192,11 +199,13 @@ impl BuildConfig {
 
             let mut replaced = false;
             if let Some(flags) = rustflags_item.as_array_mut() {
-                for value in flags.iter_mut() {
-                    if let Some(flag) =
-                        value.as_str().and_then(fixed_stack_flag)
+                for index in 0..flags.len() {
+                    if let Some(flag) = flags
+                        .get(index)
+                        .and_then(Value::as_str)
+                        .and_then(fixed_stack_flag)
                     {
-                        *value = Value::from(flag);
+                        flags.replace(index, flag);
                         replaced = true;
                     }
                 }
@@ -223,20 +232,54 @@ impl BuildConfig {
             }
 
             if !replaced {
+                // helper function to presesrve format for appending a flag to a TOML array
+                let push_rustflag = |flags: &mut Array, rustflag: String| {
+                    let pair_decor = (0..flags.len().saturating_sub(1))
+                        .find(|&index| {
+                            flags.get(index).and_then(Value::as_str)
+                                == Some("-C")
+                        })
+                        .map(|index| {
+                            (
+                                flags.get(index).unwrap().decor().clone(),
+                                flags.get(index + 1).unwrap().decor().clone(),
+                            )
+                        });
+
+                    let mut option = Value::from("-C");
+                    let mut rustflag = Value::from(rustflag);
+                    if let Some((option_decor, rustflag_decor)) = pair_decor {
+                        *option.decor_mut() = option_decor;
+                        *rustflag.decor_mut() = rustflag_decor;
+                    } else {
+                        option.decor_mut().set_prefix("\n    ");
+                        rustflag.decor_mut().set_prefix(" ");
+                        if flags.is_empty() {
+                            flags.set_trailing("\n");
+                            flags.set_trailing_comma(true);
+                        }
+                    }
+
+                    flags.push_formatted(option);
+                    flags.push_formatted(rustflag);
+                };
                 let flags = rustflags_item
                     .as_array_mut()
                     .expect("new rustflags value is an array");
-                flags.push("-C");
-                flags.push(format!(
-                    "link-arg=--llvm-args=-bpf-stack-size={expected}"
-                ));
+                push_rustflag(
+                    flags,
+                    format!("link-arg=--llvm-args=-bpf-stack-size={expected}"),
+                );
             }
             fs::write(&path, document.to_string()).with_context(|| {
                 format!("failed to update {}", path.display())
             })?;
         }
 
-        Ok((build_config, Some(CargoConfig { path })))
+        Ok((
+            build_config,
+            Some(CargoConfig { path, has_arch: configured_arch.is_some() }),
+        ))
     }
 
     pub(crate) fn stack_size(self) -> u64 {
@@ -281,7 +324,9 @@ mod tests {
         fs::create_dir_all(project.join(".cargo")).unwrap();
         fs::write(
             project.join(".cargo/config.toml"),
-            "[target.bpfel-unknown-none]\nrustflags = \"-C link-arg=--arch=v0 -C link-arg=--llvm-args=-bpf-stack-size=8192\"\n",
+            r#"[target.bpfel-unknown-none]
+rustflags = "-C link-arg=--arch=v0 -C link-arg=--llvm-args=-bpf-stack-size=8192"
+"#,
         )
         .unwrap();
 
@@ -289,14 +334,27 @@ mod tests {
         env::set_current_dir(&project).unwrap();
         let loaded = BuildConfig::load(None, false);
         let conflict = BuildConfig::load(Some(SbpfArch::V3), false);
+        fs::write(
+            project.join(".cargo/config.toml"),
+            r#"[target.bpfel-unknown-none]
+rustflags = "-C link-arg=--llvm-args=-bpf-stack-size=8192"
+"#,
+        )
+        .unwrap();
+        let cli_only = BuildConfig::load(Some(SbpfArch::V0), false);
         env::set_current_dir(original_dir).unwrap();
         fs::remove_dir_all(root).unwrap();
 
-        assert_eq!(loaded.unwrap().0.arch, SbpfArch::V0);
+        let (loaded, cargo_config) = loaded.unwrap();
+        assert_eq!(loaded.arch, SbpfArch::V0);
+        assert!(cargo_config.unwrap().has_arch);
         assert!(conflict
             .err()
             .unwrap()
             .to_string()
             .contains("architecture conflict"));
+        let (cli_only, cargo_config) = cli_only.unwrap();
+        assert_eq!(cli_only.arch, SbpfArch::V0);
+        assert!(!cargo_config.unwrap().has_arch);
     }
 }
